@@ -1,0 +1,303 @@
+{
+    "num_nodes": 1,
+    "link_bw": 16,
+    "link_latency": 20000,
+    "pools": [
+        {
+            "id": "short",
+            "mode": "agg",
+            "instances": [
+                0,
+                1,
+                2,
+                3,
+                4
+            ],
+            "admission": {
+                "max_total_toks": 4096
+            },
+            "fallback": [
+                "long"
+            ]
+        },
+        {
+            "id": "decode_biased",
+            "mode": "agg",
+            "instances": [
+                5,
+                6,
+                7,
+                8
+            ],
+            "admission": {
+                "max_input_toks": 4096,
+                "min_output_toks": 8192
+            },
+            "fallback": [
+                "long"
+            ]
+        },
+        {
+            "id": "pd_path",
+            "mode": "pd",
+            "prefill_instances": [
+                9,
+                10
+            ],
+            "decode_instances": [
+                11,
+                12
+            ],
+            "admission": {
+                "min_input_toks": 8192,
+                "max_input_toks": 15999
+            },
+            "fallback": [
+                "long"
+            ]
+        },
+        {
+            "id": "long",
+            "mode": "agg",
+            "instances": [
+                13,
+                14,
+                15
+            ],
+            "admission": {
+                "max_total_toks": 32768
+            },
+            "fallback": []
+        }
+    ],
+    "nodes": [
+        {
+            "num_instances": 16,
+            "cpu_mem": {
+                "mem_size": 512,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 128,
+                    "max_num_batched_tokens": 512,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 128,
+                    "max_num_batched_tokens": 512,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 128,
+                    "max_num_batched_tokens": 512,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 128,
+                    "max_num_batched_tokens": 512,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "prefill",
+                    "tp_size": 1,
+                    "max_num_seqs": 32,
+                    "max_num_batched_tokens": 2048,
+                    "long_prefill_token_threshold": 2048,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "prefill",
+                    "tp_size": 1,
+                    "max_num_seqs": 32,
+                    "max_num_batched_tokens": 2048,
+                    "long_prefill_token_threshold": 2048,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 256,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 1,
+                    "max_num_seqs": 256,
+                    "max_num_batched_tokens": 256,
+                    "enable_chunked_prefill": true
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 32,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 32,
+                    "max_num_batched_tokens": 2048
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1,
+                    "max_num_seqs": 32,
+                    "max_num_batched_tokens": 2048
+                }
+            ]
+        }
+    ]
+}
