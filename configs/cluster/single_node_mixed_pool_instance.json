@@ -1,0 +1,89 @@
+{
+    "num_nodes": 1,
+    "link_bw": 16,
+    "link_latency": 20000,
+    "pools": [
+        {
+            "id": "short",
+            "mode": "agg",
+            "instances": [0],
+            "admission": {
+                "max_total_toks": 1024,
+                "max_score": 16
+            },
+            "fallback": ["long"]
+        },
+        {
+            "id": "pd",
+            "mode": "pd",
+            "prefill_instances": [2],
+            "decode_instances": [3],
+            "admission": {
+                "min_total_toks": 1025,
+                "max_total_toks": 8192
+            },
+            "fallback": ["long"]
+        },
+        {
+            "id": "long",
+            "mode": "agg",
+            "instances": [1]
+        }
+    ],
+    "nodes": [
+        {
+            "num_instances": 4,
+            "cpu_mem": {
+                "mem_size": 512,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": null,
+                    "tp_size": 1
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "prefill",
+                    "tp_size": 1
+                },
+                {
+                    "model_name": "meta-llama/Llama-3.1-8B",
+                    "hardware": "RTXPRO6000",
+                    "npu_mem": {
+                        "mem_size": 96,
+                        "mem_bw": 1597,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 1
+                }
+            ]
+        }
+    ]
+}

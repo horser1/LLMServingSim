@@ -55,6 +55,11 @@ class Request:
         self.pd_decode_queue_delay = -1
         self.pd_handoff_kv_bytes = 0
         self.pd_source_kv_bytes = 0
+        # For pool-level routing and future migration modeling
+        self.pool_id = None
+        self.fallback_from = None
+        self.route_history = []
+        self.migration_history = []
 
     # to print the request information
     def __str__(self):
@@ -122,4 +127,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

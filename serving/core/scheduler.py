@@ -1093,8 +1093,13 @@ class Scheduler:
         return self.batch_ids
 
     # add a request
-    def add_request(self, req, is_init=True):
+    def add_request(self, req, is_init=True, pool_id=None, fallback_from=None,
+                    route_history=None, migration_history=None):
         new_req = Request(*(req), is_init=is_init)
+        new_req.pool_id = pool_id
+        new_req.fallback_from = fallback_from
+        new_req.route_history = list(route_history or [])
+        new_req.migration_history = list(migration_history or [])
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
@@ -1234,7 +1239,8 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
+                writer.writerow(['instance id', 'pool id', 'fallback from', 'route history',
+                                'request id', 'model', 'input', 'output', 
                                 'arrival', 'end_time', 'latency', 
                                 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
                                 'pd_prefill_instance_id', 'pd_decode_instance_id',
@@ -1246,6 +1252,9 @@ class Scheduler:
             for req in self.done:
                 writer.writerow([
                     req.instance_id,
+                    req.pool_id,
+                    req.fallback_from,
+                    req.route_history,
                     req.id,
                     req.model,
                     req.input,

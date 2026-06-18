@@ -46,6 +46,47 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `num_nodes` | Integer | Number of nodes in the cluster |
 | `link_bw` | Float or Array<Float> | ASTRA-Sim topology link bandwidth in GB/s. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
 | `link_latency` | Float or Array<Float> | ASTRA-Sim topology link latency in ns. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
+| `pools` | Array | Optional routing pools. Required when a config mixes `pd_type: null` agg instances with P/D instances |
+
+### Routing pools
+
+`pools` groups instances for request routing. When absent, pure agg configs
+auto-create one agg pool and pure P/D configs auto-create one P/D pool. Mixed
+agg + P/D configs must define pools explicitly.
+
+```json
+"pools": [
+  {
+    "id": "short",
+    "mode": "agg",
+    "instances": [0],
+    "admission": {"max_total_toks": 1024, "max_score": 16},
+    "fallback": ["long"]
+  },
+  {
+    "id": "pd",
+    "mode": "pd",
+    "prefill_instances": [2],
+    "decode_instances": [3],
+    "admission": {"min_total_toks": 1025, "max_total_toks": 8192}
+  },
+  {
+    "id": "long",
+    "mode": "agg",
+    "instances": [1]
+  }
+]
+```
+
+Router scans pools in config order and chooses the first pool whose token
+admission rules match the request. If that pool exceeds a load gate, Router
+tries its ordered `fallback` targets. Fallback happens only before a request
+enters a scheduler; running requests are not migrated between pools.
+
+Admission rules support `min_input_toks`, `max_input_toks`, `min_output_toks`,
+`max_output_toks`, `min_total_toks`, `max_total_toks`, `max_waiting`,
+`max_running`, and `max_score`. Pool score is `waiting * 4 + running`, summed
+across the pool's candidate schedulers for the relevant role.
 
 ### Per-node fields
 
@@ -168,3 +209,4 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 | `single_node_power_instance.json` | Single node with power modeling enabled |
 | `dual_node_multi_instance.json` | Two nodes, two instances each |
 | `dual_node_moe_dp_ep_intra_inter_instance.json` | Two-node MoE DP+EP example with per-dimension intra/inter link settings |
+| `single_node_mixed_pool_instance.json` | Single node with short/long agg pools and one P/D pool |

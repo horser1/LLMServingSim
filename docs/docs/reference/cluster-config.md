@@ -26,6 +26,7 @@ generates derived ASTRA-Sim input files (`network.yml`,
   "link_bw": 16,
   "link_latency": 20000,
   "nodes": [...],
+  "pools": [...],
   "cxl_mem": {...}
 }
 ```
@@ -36,11 +37,74 @@ generates derived ASTRA-Sim input files (`network.yml`,
 | `link_bw` | float or float[] | ✓ |  | ASTRA-Sim topology link bandwidth in **GB/s**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
 | `link_latency` | float or float[] | ✓ |  | ASTRA-Sim topology link latency in **ns**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
 | `nodes` | array | ✓ |  | Length must equal `num_nodes` |
+| `pools` | array | optional | synthesized for legacy pure configs | Routing pools for admission and fallback |
 | `cxl_mem` | object | optional | absent | CXL memory expansion (see below) |
 
 Example: if `network.yml` will end up with `npus_count: [4, 2]`, you may set
 `link_bw: [900, 100]` and `link_latency: [0, 20000]` to assign different
 bandwidth/latency per topology dimension.
+
+## `pools` (top-level, optional)
+
+`pools` groups instances for request routing. It is optional for legacy
+configs: pure colocated configs synthesize one `agg` pool, and pure P/D
+configs synthesize one `pd` pool. A config that mixes `pd_type: null`
+instances with `"prefill"` / `"decode"` instances must define `pools`.
+
+```json
+"pools": [
+  {
+    "id": "short",
+    "mode": "agg",
+    "instances": [0],
+    "admission": {"max_total_toks": 1024, "max_score": 16},
+    "fallback": ["long"]
+  },
+  {
+    "id": "pd",
+    "mode": "pd",
+    "prefill_instances": [2],
+    "decode_instances": [3],
+    "admission": {"min_total_toks": 1025, "max_total_toks": 8192},
+    "fallback": ["long"]
+  },
+  {
+    "id": "long",
+    "mode": "agg",
+    "instances": [1]
+  }
+]
+```
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `id` | string | ✓ | Unique pool id |
+| `mode` | string | ✓ | `"agg"` for colocated instances or `"pd"` for P/D disaggregation |
+| `instances` | int[] | `agg` only | Global instance ids in this agg pool; referenced instances must have `pd_type: null` |
+| `prefill_instances` | int[] | `pd` only | Global prefill instance ids; referenced instances must have `pd_type: "prefill"` |
+| `decode_instances` | int[] | `pd` only | Global decode instance ids; referenced instances must have `pd_type: "decode"` |
+| `admission` | object | optional | Token and load gates for this pool |
+| `fallback` | string[] | optional | Ordered target pool ids to try when this pool is overloaded |
+
+Router scans pools in config order and chooses the first pool whose token
+admission rules match the request. If that pool fails a load gate, Router
+walks its `fallback` targets in order. Fallback only happens before a request
+enters a scheduler; running requests are not migrated between pools.
+
+`admission` supports:
+
+| Field | Description |
+| --- | --- |
+| `min_input_toks`, `max_input_toks` | Bounds on prompt length |
+| `min_output_toks`, `max_output_toks` | Bounds on generated output tokens |
+| `min_total_toks`, `max_total_toks` | Bounds on prompt + generated output tokens |
+| `max_waiting` | Reject pool when waiting requests across candidate schedulers reach this value |
+| `max_running` | Reject pool when running requests across candidate schedulers reach this value |
+| `max_score` | Reject pool when `waiting * 4 + running` reaches this value |
+
+Pool validation requires every instance to belong to exactly one pool, fallback
+targets to exist, fallback edges to be acyclic, all instances in a pool to use
+the same model, and fallback source/target pools to use the same model.
 
 ## `cxl_mem` (top-level, optional)
 

@@ -335,6 +335,7 @@ def main():
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
+    pools = cluster["pools"]
     inst2node_mapping = cluster["inst2node_mapping"]
     inst2npu_mapping = cluster["inst2npu_mapping"]
     npu2inst_mapping = cluster["npu2inst_mapping"]
@@ -472,7 +473,7 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy, pools=pools)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -491,7 +492,6 @@ def main():
     current = 0 # current tick of the system
     sys = 0 # current system id (NPU id)
     id = 0 # id of the request
-    is_prefill_done = False # flag to check if prefill is done
     done_instance = [] # list of done instances
     done_inst_npus = [[] for _ in range(num_instances)]
     start_time = time()
@@ -906,7 +906,11 @@ def main():
                 )
         # check if all requests are done for current instance#
         # NOTE: 'instance_id' could occur in duplicate, because 'npu2inst_mapping[sys]' is not one-to-one mapping
-        if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions():
+        can_finish_role = (
+            instance_id not in decode_instance
+            or router.can_decode_instance_finish(instance_id)
+        )
+        if can_finish_role and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions():
             # For DP groups: only mark done when ALL members of the group are empty
             dg = inst_dp_group.get(instance_id)
             if dg is not None:
@@ -925,10 +929,6 @@ def main():
                 done_inst_npus[instance_id].append(sys)
             if len(done_inst_npus[instance_id]) == (1 if instances[instance_id]["num_npus"] == 1 else 2):
                 done_instance.append(instance_id)
-
-            # check if all prefill instances are done
-            if len(done_instance) == len(prefill_instance):
-                is_prefill_done = True
 
             # check if all instances are done
             if len(done_instance) == num_instances:

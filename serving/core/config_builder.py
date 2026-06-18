@@ -269,6 +269,215 @@ def _sync_system_collective_dims(system_config_path, instances):
         json.dump(system_config, f, ensure_ascii=False, indent=2)
 
 
+_POOL_ADMISSION_KEYS = {
+    "min_input_toks",
+    "max_input_toks",
+    "min_output_toks",
+    "max_output_toks",
+    "min_total_toks",
+    "max_total_toks",
+    "max_waiting",
+    "max_running",
+    "max_score",
+}
+
+
+def _validate_pool_admission(pool_id, admission):
+    if admission is None:
+        return {}
+    if not isinstance(admission, dict):
+        raise TypeError(f"Pool '{pool_id}' admission must be an object.")
+
+    normalized = {}
+    for key, value in admission.items():
+        if key not in _POOL_ADMISSION_KEYS:
+            raise ValueError(f"Pool '{pool_id}' has unknown admission key '{key}'.")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f"Pool '{pool_id}' admission.{key} must be numeric.")
+        normalized[key] = value
+    return normalized
+
+
+def _validate_pool_fallback_graph(pools):
+    pool_ids = {p["id"] for p in pools}
+    for pool in pools:
+        for target in pool["fallback"]:
+            if target not in pool_ids:
+                raise ValueError(f"Pool '{pool['id']}' fallback target '{target}' does not exist.")
+
+    visiting = set()
+    visited = set()
+
+    def visit(pool_id):
+        if pool_id in visited:
+            return
+        if pool_id in visiting:
+            raise ValueError(f"Pool fallback graph contains a cycle at pool '{pool_id}'.")
+        visiting.add(pool_id)
+        pool = next(p for p in pools if p["id"] == pool_id)
+        for target in pool["fallback"]:
+            visit(target)
+        visiting.remove(pool_id)
+        visited.add(pool_id)
+
+    for pool in pools:
+        visit(pool["id"])
+
+
+def _normalize_pools(cluster_config, instances):
+    """Normalize routing pools and attach pool_id to each instance.
+
+    ``pools`` is optional. Legacy pure agg or pure P/D configs are converted
+    to a single default pool; mixed agg + P/D configs must define pools
+    explicitly.
+    """
+    instance_by_id = {inst["instance_id"]: inst for inst in instances}
+    explicit_pools = cluster_config.get("pools")
+
+    if explicit_pools is None:
+        agg_instances = [inst["instance_id"] for inst in instances if inst.get("pd_type") is None]
+        prefill_instances = [inst["instance_id"] for inst in instances if inst.get("pd_type") == "prefill"]
+        decode_instances = [inst["instance_id"] for inst in instances if inst.get("pd_type") == "decode"]
+
+        if agg_instances and not prefill_instances and not decode_instances:
+            explicit_pools = [{
+                "id": "default",
+                "mode": "agg",
+                "instances": agg_instances,
+            }]
+        elif not agg_instances and prefill_instances and decode_instances:
+            explicit_pools = [{
+                "id": "default",
+                "mode": "pd",
+                "prefill_instances": prefill_instances,
+                "decode_instances": decode_instances,
+            }]
+        elif not instances:
+            explicit_pools = []
+        else:
+            raise ValueError(
+                "Cluster config mixes agg (pd_type null) and P/D instances, "
+                "or defines incomplete P/D roles. Add top-level 'pools' to "
+                "make routing explicit."
+            )
+
+    if not isinstance(explicit_pools, list):
+        raise TypeError("Top-level 'pools' must be a list.")
+    if not explicit_pools:
+        raise ValueError("Top-level 'pools' must contain at least one pool.")
+
+    normalized = []
+    seen_pool_ids = set()
+    instance_to_pool = {}
+
+    for pool_cfg in explicit_pools:
+        if not isinstance(pool_cfg, dict):
+            raise TypeError("Each pool entry must be an object.")
+        pool_id = pool_cfg.get("id")
+        mode = pool_cfg.get("mode")
+        if not isinstance(pool_id, str) or not pool_id:
+            raise ValueError("Each pool must have a non-empty string 'id'.")
+        if pool_id in seen_pool_ids:
+            raise ValueError(f"Duplicate pool id '{pool_id}'.")
+        seen_pool_ids.add(pool_id)
+
+        if mode not in ("agg", "pd"):
+            raise ValueError(f"Pool '{pool_id}' mode must be 'agg' or 'pd'.")
+
+        fallback = pool_cfg.get("fallback", [])
+        if fallback is None:
+            fallback = []
+        if not isinstance(fallback, list) or not all(isinstance(x, str) for x in fallback):
+            raise TypeError(f"Pool '{pool_id}' fallback must be a list of pool ids.")
+
+        admission = _validate_pool_admission(pool_id, pool_cfg.get("admission", {}))
+        pool = {
+            "id": pool_id,
+            "mode": mode,
+            "admission": admission,
+            "fallback": list(fallback),
+        }
+
+        if mode == "agg":
+            inst_ids = pool_cfg.get("instances")
+            if not isinstance(inst_ids, list) or len(inst_ids) == 0:
+                raise ValueError(f"Pool '{pool_id}' requires non-empty 'instances'.")
+            if "prefill_instances" in pool_cfg or "decode_instances" in pool_cfg:
+                raise ValueError(f"Pool '{pool_id}' is agg and must not define P/D instance lists.")
+            pool["instances"] = list(inst_ids)
+            pool["prefill_instances"] = []
+            pool["decode_instances"] = []
+        else:
+            prefill_ids = pool_cfg.get("prefill_instances")
+            decode_ids = pool_cfg.get("decode_instances")
+            if not isinstance(prefill_ids, list) or len(prefill_ids) == 0:
+                raise ValueError(f"Pool '{pool_id}' requires non-empty 'prefill_instances'.")
+            if not isinstance(decode_ids, list) or len(decode_ids) == 0:
+                raise ValueError(f"Pool '{pool_id}' requires non-empty 'decode_instances'.")
+            if "instances" in pool_cfg:
+                raise ValueError(f"Pool '{pool_id}' is pd and must not define 'instances'.")
+            pool["instances"] = list(prefill_ids) + list(decode_ids)
+            pool["prefill_instances"] = list(prefill_ids)
+            pool["decode_instances"] = list(decode_ids)
+
+        pool_models = set()
+        for inst_id in pool["instances"]:
+            if not isinstance(inst_id, int):
+                raise TypeError(f"Pool '{pool_id}' instance ids must be integers.")
+            if inst_id not in instance_by_id:
+                raise ValueError(f"Pool '{pool_id}' references unknown instance id {inst_id}.")
+            if inst_id in instance_to_pool:
+                raise ValueError(
+                    f"Instance {inst_id} belongs to both pool '{instance_to_pool[inst_id]}' "
+                    f"and pool '{pool_id}'."
+                )
+
+            inst = instance_by_id[inst_id]
+            pd_type = inst.get("pd_type")
+            if mode == "agg" and pd_type is not None:
+                raise ValueError(f"Pool '{pool_id}' is agg but instance {inst_id} has pd_type '{pd_type}'.")
+            if mode == "pd":
+                if inst_id in pool["prefill_instances"] and pd_type != "prefill":
+                    raise ValueError(f"Pool '{pool_id}' prefill instance {inst_id} must have pd_type 'prefill'.")
+                if inst_id in pool["decode_instances"] and pd_type != "decode":
+                    raise ValueError(f"Pool '{pool_id}' decode instance {inst_id} must have pd_type 'decode'.")
+
+            instance_to_pool[inst_id] = pool_id
+            inst["pool_id"] = pool_id
+            pool_models.add(inst["model_name"])
+
+        if len(pool_models) != 1:
+            raise ValueError(f"Pool '{pool_id}' must contain instances for exactly one model.")
+        pool["model_name"] = next(iter(pool_models))
+        normalized.append(pool)
+
+    missing = sorted(set(instance_by_id) - set(instance_to_pool))
+    if missing:
+        raise ValueError(f"Instances not assigned to any pool: {missing}.")
+
+    _validate_pool_fallback_graph(normalized)
+
+    pool_by_id = {pool["id"]: pool for pool in normalized}
+    for pool in normalized:
+        for target in pool["fallback"]:
+            if pool["model_name"] != pool_by_id[target]["model_name"]:
+                raise ValueError(
+                    f"Pool '{pool['id']}' fallback target '{target}' uses a different model."
+                )
+
+    dp_group_pools = {}
+    for inst in instances:
+        dg = inst.get("dp_group")
+        if dg is None:
+            continue
+        pool_id = inst["pool_id"]
+        if dg in dp_group_pools and dp_group_pools[dg] != pool_id:
+            raise ValueError(f"DP group '{dg}' cannot span multiple pools.")
+        dp_group_pools[dg] = pool_id
+
+    return normalized
+
+
 # parse cluster configuration from JSON file and build config file for astra-sim
 def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
@@ -628,6 +837,11 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     # Resolve DP groups across all instances.
     _resolve_dp_groups(total_instances)
 
+    # Normalize routing pools after instances have global ids and DP groups
+    # have been resolved. Legacy pure agg or pure P/D configs synthesize a
+    # default pool; mixed agg + P/D configs must define pools explicitly.
+    pools = _normalize_pools(cluster_config, total_instances)
+
     # Keep collective implementation arity aligned with the final global
     # ASTRA-Sim topology, while preserving the default ring implementation.
     _sync_system_collective_dims(system_config_path, total_instances)
@@ -642,6 +856,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "num_nodes": num_nodes,
         "num_instances": total_num_instances,
         "instances": total_instances,
+        "pools": pools,
         "inst2node_mapping": inst2node_mapping,
         "inst2npu_mapping": inst2npu_mapping,
         "npu2inst_mapping": npu2inst_mapping,

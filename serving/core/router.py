@@ -1,4 +1,3 @@
-import bisect
 import json
 import random
 from .logger import get_logger
@@ -10,20 +9,17 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            pools=None,
     ):
         self.schedulers = schedulers
+        self.scheduler_by_id = {s.instance_id: s for s in schedulers}
         self.num_instances = num_instances
-        self.prefill_schedulers = [s for s in schedulers if s.pd_type != "decode"]
-        self.prefill_instances = len(self.prefill_schedulers)
-        self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
-        self.decode_instances = len(self.decode_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
         self._rnd = random.Random(seed) if seed is not None else random
-        self.prefill_rr_counter = 0
-        self.decode_rr_counter = 0
+        self._selection_counters = {}
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -47,36 +43,113 @@ class Router:
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
                              "Supported: RR, RAND, LOAD, CUSTOM")
+
+        self.pools = self._build_pool_states(pools)
+        self.pool_by_id = {p["id"]: p for p in self.pools}
+        self.instance_pool = {}
+        for pool in self.pools:
+            for inst_id in pool["instances"]:
+                self.instance_pool[inst_id] = pool["id"]
+
         self.logger = get_logger(self.__class__)
+
+    # -----------------------------------------------------------------------
+    # Pool setup
+    # -----------------------------------------------------------------------
+
+    def _legacy_pools_from_schedulers(self):
+        agg_instances = [s.instance_id for s in self.schedulers if s.pd_type is None]
+        prefill_instances = [s.instance_id for s in self.schedulers if s.pd_type == "prefill"]
+        decode_instances = [s.instance_id for s in self.schedulers if s.pd_type == "decode"]
+
+        if agg_instances and not prefill_instances and not decode_instances:
+            return [{
+                "id": "default",
+                "mode": "agg",
+                "instances": agg_instances,
+                "prefill_instances": [],
+                "decode_instances": [],
+                "admission": {},
+                "fallback": [],
+            }]
+        if not agg_instances and prefill_instances and decode_instances:
+            return [{
+                "id": "default",
+                "mode": "pd",
+                "instances": prefill_instances + decode_instances,
+                "prefill_instances": prefill_instances,
+                "decode_instances": decode_instances,
+                "admission": {},
+                "fallback": [],
+            }]
+        raise ValueError("Mixed agg and P/D routing requires explicit pools.")
+
+    def _build_pool_states(self, pools):
+        pools = pools if pools is not None else self._legacy_pools_from_schedulers()
+        states = []
+        for pool_cfg in pools:
+            pool = dict(pool_cfg)
+            pool.setdefault("admission", {})
+            pool.setdefault("fallback", [])
+            pool.setdefault("prefill_instances", [])
+            pool.setdefault("decode_instances", [])
+            if pool["mode"] == "agg":
+                pool["agg_schedulers"] = self._schedulers_for_ids(pool["instances"], pool["id"], "agg")
+                pool["prefill_schedulers"] = []
+                pool["decode_schedulers"] = []
+            elif pool["mode"] == "pd":
+                pool["agg_schedulers"] = []
+                pool["prefill_schedulers"] = self._schedulers_for_ids(
+                    pool["prefill_instances"], pool["id"], "prefill")
+                pool["decode_schedulers"] = self._schedulers_for_ids(
+                    pool["decode_instances"], pool["id"], "decode")
+            else:
+                raise ValueError(f"Unknown pool mode '{pool['mode']}' for pool '{pool['id']}'.")
+            states.append(pool)
+        return states
+
+    def _schedulers_for_ids(self, instance_ids, pool_id, role):
+        schedulers = []
+        for inst_id in instance_ids:
+            if inst_id not in self.scheduler_by_id:
+                raise ValueError(f"Pool '{pool_id}' references unknown instance {inst_id}.")
+            schedulers.append(self.scheduler_by_id[inst_id])
+        if not schedulers:
+            raise ValueError(f"Pool '{pool_id}' has no {role} schedulers.")
+        return schedulers
 
     # -----------------------------------------------------------------------
     # Instance selection policies
     # -----------------------------------------------------------------------
 
-    def _get_counter(self, role):
-        return self.decode_rr_counter if role == "decode" else self.prefill_rr_counter
+    def _get_counter(self, counter_key):
+        return self._selection_counters.get(counter_key, 0)
 
-    def _set_counter(self, role, value):
-        if role == "decode":
-            self.decode_rr_counter = value
-        else:
-            self.prefill_rr_counter = value
+    def _set_counter(self, counter_key, value):
+        self._selection_counters[counter_key] = value
 
-    def _rr_select(self, schedulers, role):
+    def _rr_select(self, schedulers, counter_key):
         num_instances = len(schedulers)
-        idx = self._get_counter(role) % num_instances
-        self._set_counter(role, idx + 1)
+        if num_instances == 0:
+            raise RuntimeError("No scheduler candidates are available for routing.")
+        idx = self._get_counter(counter_key) % num_instances
+        self._set_counter(counter_key, idx + 1)
         return idx
 
-    def _rand_select(self, schedulers, role):
-        return self._rnd.randrange(len(schedulers))
+    def _rand_select(self, schedulers, counter_key):
+        num_instances = len(schedulers)
+        if num_instances == 0:
+            raise RuntimeError("No scheduler candidates are available for routing.")
+        return self._rnd.randrange(num_instances)
 
-    def _least_load_select(self, schedulers, role):
+    def _least_load_select(self, schedulers, counter_key):
         """vLLM-style least-loaded routing, normalized by instance capacity."""
+        num_instances = len(schedulers)
+        if num_instances == 0:
+            raise RuntimeError("No scheduler candidates are available for routing.")
         best_idx = 0
         best_score = float('inf')
-        num_instances = len(schedulers)
-        start = self._get_counter(role) % num_instances
+        start = self._get_counter(counter_key) % num_instances
         for offset in range(num_instances):
             idx = (start + offset) % num_instances
             sched = schedulers[idx]
@@ -90,11 +163,135 @@ class Router:
             if score < best_score:
                 best_score = score
                 best_idx = idx
-        self._set_counter(role, (best_idx + 1) % num_instances)
+        self._set_counter(counter_key, (best_idx + 1) % num_instances)
         return best_idx
 
-    def _custom_select(self, schedulers, role):
+    def _custom_select(self, schedulers, counter_key):
         raise NotImplementedError("Implement custom routing policy.")
+
+    # -----------------------------------------------------------------------
+    # Pool admission and fallback
+    # -----------------------------------------------------------------------
+
+    def _token_metrics(self, req_data):
+        input_toks = int(req_data["input_toks"])
+        total_toks = int(req_data["output_toks"])
+        output_toks = max(0, total_toks - input_toks)
+        return {
+            "input_toks": input_toks,
+            "output_toks": output_toks,
+            "total_toks": total_toks,
+        }
+
+    def _token_admission_passes(self, pool, req_data):
+        admission = pool.get("admission") or {}
+        metrics = self._token_metrics(req_data)
+        checks = (
+            ("min_input_toks", "input_toks", lambda actual, limit: actual >= limit),
+            ("max_input_toks", "input_toks", lambda actual, limit: actual <= limit),
+            ("min_output_toks", "output_toks", lambda actual, limit: actual >= limit),
+            ("max_output_toks", "output_toks", lambda actual, limit: actual <= limit),
+            ("min_total_toks", "total_toks", lambda actual, limit: actual >= limit),
+            ("max_total_toks", "total_toks", lambda actual, limit: actual <= limit),
+        )
+        for key, metric, predicate in checks:
+            if key in admission and not predicate(metrics[metric], admission[key]):
+                return False
+        return True
+
+    def _initial_role(self, pool):
+        return "agg" if pool["mode"] == "agg" else "prefill"
+
+    def _schedulers_for_role(self, pool, role):
+        if role == "agg":
+            return pool["agg_schedulers"]
+        if role == "prefill":
+            return pool["prefill_schedulers"]
+        if role == "decode":
+            return pool["decode_schedulers"]
+        raise ValueError(f"Unknown routing role '{role}'.")
+
+    def _pool_load(self, pool, role):
+        schedulers = self._schedulers_for_role(pool, role)
+        waiting = sum(len(s.request) for s in schedulers)
+        running = sum(len(b.requests) for s in schedulers for b in s.inflight)
+        return waiting, running, waiting * 4 + running
+
+    def _load_admission_passes(self, pool, role):
+        admission = pool.get("admission") or {}
+        waiting, running, score = self._pool_load(pool, role)
+        if "max_waiting" in admission and waiting >= admission["max_waiting"]:
+            return False
+        if "max_running" in admission and running >= admission["max_running"]:
+            return False
+        if "max_score" in admission and score >= admission["max_score"]:
+            return False
+        return True
+
+    def _select_pool(self, req_data):
+        for pool in self.pools:
+            if not self._token_admission_passes(pool, req_data):
+                continue
+            role = self._initial_role(pool)
+            if self._load_admission_passes(pool, role):
+                return pool, None
+            fallback_pool = self._select_fallback_pool(pool, req_data)
+            if fallback_pool is not None:
+                return fallback_pool, pool["id"]
+            return None, None
+        return None, None
+
+    def _select_fallback_pool(self, source_pool, req_data):
+        visited = set()
+
+        def walk(pool_id):
+            if pool_id in visited:
+                return None
+            visited.add(pool_id)
+            pool = self.pool_by_id[pool_id]
+            role = self._initial_role(pool)
+            if self._token_admission_passes(pool, req_data) and self._load_admission_passes(pool, role):
+                return pool
+            for target in pool.get("fallback", []):
+                selected = walk(target)
+                if selected is not None:
+                    return selected
+            return None
+
+        for target in source_pool.get("fallback", []):
+            selected = walk(target)
+            if selected is not None:
+                return selected
+        return None
+
+    def _select_pool_scheduler(self, pool, role):
+        schedulers = self._schedulers_for_role(pool, role)
+        idx = self._select_instance(schedulers, f"{pool['id']}:{role}")
+        return schedulers[idx]
+
+    def _route_request_to_scheduler(self, sched, req_data, pool, role, fallback_from):
+        route_entry = {
+            "pool_id": pool["id"],
+            "role": role,
+            "instance_id": sched.instance_id,
+        }
+        route_history = [route_entry]
+
+        if self._enable_prefix_caching:
+            sched.add_request([
+                req_data["index"], sched.model,
+                req_data["input_toks"], req_data["output_toks"],
+                req_data["arrival_time_ns"], sched.instance_id,
+                req_data.get("input_hash_ids", []), req_data.get("output_hash_ids", []),
+            ], is_init=self._is_init, pool_id=pool["id"],
+                fallback_from=fallback_from, route_history=route_history)
+        else:
+            sched.add_request([
+                req_data["index"], sched.model,
+                req_data["input_toks"], req_data["output_toks"],
+                req_data["arrival_time_ns"], sched.instance_id,
+            ], is_init=self._is_init, pool_id=pool["id"],
+                fallback_from=fallback_from, route_history=route_history)
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -187,33 +384,20 @@ class Router:
         return len(sub_reqs)
 
     def route_arrived_requests(self, current_time_ns):
-        """Route requests that have arrived by current_time_ns to instances.
-
-        Called at the start of each iteration in the main simulation loop.
-        Returns the number of newly routed requests.
-        """
+        """Route requests that have arrived by current_time_ns to pools."""
         routed = 0
         while self._pending_idx < len(self._pending_requests):
             req_data = self._pending_requests[self._pending_idx]
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
-            sched = self.prefill_schedulers[instance_id]
+            pool, fallback_from = self._select_pool(req_data)
+            if pool is None:
+                break
 
-            if sched.enable_prefix_caching:
-                sched.add_request([
-                    req_data['index'], sched.model,
-                    req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], sched.instance_id,
-                    req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
-                ], is_init=self._is_init)
-            else:
-                sched.add_request([
-                    req_data['index'], sched.model,
-                    req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], sched.instance_id,
-                ], is_init=self._is_init)
+            role = self._initial_role(pool)
+            sched = self._select_pool_scheduler(pool, role)
+            self._route_request_to_scheduler(sched, req_data, pool, role, fallback_from)
 
             self._pending_idx += 1
             routed += 1
@@ -235,11 +419,7 @@ class Router:
     # -----------------------------------------------------------------------
 
     def notify_request_completed(self, request_id, completion_time_ns):
-        """Called when a request finishes. Releases the next sub-request in
-        the session chain after the tool_call duration elapses.
-
-        For flat requests (not in a session), this is a no-op.
-        """
+        """Release the next sub-request in a session after tool latency."""
         session_info = self._request_to_session.pop(request_id, None)
         if session_info is None:
             return
@@ -276,12 +456,11 @@ class Router:
             self._request_to_session[next_id] = (session_id, next_idx)
             session['next_index'] = next_idx + 1
         else:
-            # Session complete — all sub-requests have been released
+            # Session complete; all sub-requests have been released.
             del self._deferred_sessions[session_id]
 
     def _insert_pending_sorted(self, req_data):
-        """Insert a request into _pending_requests maintaining arrival-time
-        sort order for the not-yet-consumed portion (from _pending_idx onward)."""
+        """Insert a request in arrival-time order for the unconsumed suffix."""
         arrival = req_data['arrival_time_ns']
         # Binary search in the unconsumed portion
         lo = self._pending_idx
@@ -303,6 +482,47 @@ class Router:
         if self._pending_idx < len(self._pending_requests):
             return self._pending_requests[self._pending_idx]['arrival_time_ns']
         return None
+
+    # -----------------------------------------------------------------------
+    # P/D handoff, runtime migration hook, and completion helpers
+    # -----------------------------------------------------------------------
+
+    def transfer_prefill_request(self, requests):
+        for req in requests:
+            pool_id = req.pool_id
+            if pool_id is None:
+                pd_pools = [p for p in self.pools if p["mode"] == "pd"]
+                if len(pd_pools) != 1:
+                    raise RuntimeError("Prefill request is missing pool_id.")
+                pool = pd_pools[0]
+                req.pool_id = pool["id"]
+            else:
+                pool = self.pool_by_id.get(pool_id)
+            if pool is None or pool["mode"] != "pd":
+                raise RuntimeError(f"Request #{req.id} cannot transfer to decode pool '{pool_id}'.")
+
+            sched = self._select_pool_scheduler(pool, "decode")
+            req.route_history.append({
+                "pool_id": pool["id"],
+                "role": "decode",
+                "instance_id": sched.instance_id,
+            })
+            sched.add_decode(req)
+
+    def maybe_migrate_request(self, req, current_time_ns):
+        return False
+
+    def can_decode_instance_finish(self, instance_id):
+        pool_id = self.instance_pool.get(instance_id)
+        if pool_id is None:
+            return True
+        pool = self.pool_by_id[pool_id]
+        if pool["mode"] != "pd":
+            return True
+        return not any(
+            len(s.request) > 0 or len(s.inflight) > 0
+            for s in pool["prefill_schedulers"]
+        )
 
     # -----------------------------------------------------------------------
     # Legacy: upfront routing (kept for backward compat)
