@@ -28,6 +28,7 @@ matching runtime knobs per `instances[i]`; see
 | `--max-num-batched-tokens` | int | `2048` | Max tokens per iteration across all requests (token budget) |
 | `--long-prefill-token-threshold` | int | `0` | Per-request token cap per step for chunked prefill. `0` = disabled |
 | `--enable-chunked-prefill` | bool | `True` | Split long prefill across iterations. Use `--no-enable-chunked-prefill` to disable |
+| `--pd-handoff-mode` | `deferred` / `legacy` | `deferred` | P/D handoff policy. `deferred` waits for decode-side memory admission; `legacy` immediately imports prefilled KV on the decode worker |
 | `--prioritize-prefill` | flag | off | Run prefill before decode in the same iteration |
 | `--block-size` | int | `16` | KV cache block size in tokens |
 | `--skip-prefill` | flag | off | Skip prefill, run decode only |

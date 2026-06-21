@@ -446,6 +446,7 @@ def print_input_config(args: Any) -> None:
     add("request_routing_policy", "Request routing", _na)
     add("expert_routing_policy", "Expert routing", _na)
     add("enable_prefix_caching", "Prefix caching", _yn)
+    add("pd_handoff_mode", "P/D handoff mode", _na)
     add("enable_chunked_prefill", "Chunked prefill", _yn)
     add("prefix_storage", "Prefix caching scheme", _pc)
     add("enable_prefix_sharing", "Centralized prefix caching", _yn)

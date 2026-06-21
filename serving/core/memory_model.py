@@ -360,7 +360,7 @@ class MemoryModel():
             return 0
         
         if device == Device.NPU:
-            return self.npu_prefix_cache.avail_size()
+            return max(self.npu_mem - self.npu_used, 0)
         elif device == Device.CPU or device == Device.CXL:
             return self.second_tier_prefix_cache.avail_size()
         else:

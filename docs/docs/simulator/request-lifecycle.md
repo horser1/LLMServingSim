@@ -215,8 +215,12 @@ wave-synchronizing them.
 
 For prefill instances (`pd_type="prefill"`), finished requests are
 **transferred** to a decode instance via
-`router.transfer_prefill_request`. The KV cache transfer cost is
-modeled as inter-link bandwidth based on KV size.
+`router.transfer_prefill_request`. With the default
+`--pd-handoff-mode deferred`, the decode scheduler queues the request
+until its KV cache can be admitted, then releases the prefill-side KV
+lease. `--pd-handoff-mode legacy` immediately imports the KV on the
+decode instance, matching older simulator behavior. (The KV cache transfer cost is
+modeled as inter-link bandwidth based on KV size.)
 
 ## Stage 10, Output
 

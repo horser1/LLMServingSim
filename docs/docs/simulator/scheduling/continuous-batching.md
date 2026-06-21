@@ -155,7 +155,12 @@ iteration when ASTRA-Sim reports completion. It returns:
 
 For prefill instances under P/D disaggregation, the main loop hands
 `finished_requests` to `router.transfer_prefill_request` so the
-decode instance picks them up.
+decode instance picks them up. By default, `--pd-handoff-mode deferred`
+keeps the prefilled KV owned by the prefill instance until the selected
+decode instance admits the request and has memory for the imported KV.
+`--pd-handoff-mode legacy` restores the older immediate-import behavior
+for reproducing old runs; it may fail immediately if the decode instance
+does not have enough free KV memory.
 
 ## Gotchas
 

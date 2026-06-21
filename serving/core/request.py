@@ -31,6 +31,8 @@ class Request:
         self.npu_last_node = None
         self.cpu_last_node = None
         self.storage_last_node = None
+        self.prefix_npu_stats_recorded = False
+        self.prefix_storage_stats_recorded = False
 
         # For prefix cache lock tracking
         self._prefix_locked = False
@@ -40,6 +42,19 @@ class Request:
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None
         self.sub_request_index = None
+
+        # For P/D handoff. Prefill KV ownership stays on the P instance until
+        # the selected D instance admits the request and allocates/imports it.
+        self.pd_prefill_instance_id = None
+        self.pd_decode_instance_id = None
+        self.pd_handoff_pending = False
+        self.pd_decode_kv_loaded = False
+        self.pd_prefill_done_time = -1
+        self.pd_decode_enqueue_time = -1
+        self.pd_decode_admit_time = -1
+        self.pd_decode_queue_delay = -1
+        self.pd_handoff_kv_bytes = 0
+        self.pd_source_kv_bytes = 0
 
     # to print the request information
     def __str__(self):

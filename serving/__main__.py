@@ -245,6 +245,10 @@ def main():
     parser.add_argument('--enable-chunked-prefill', action=argparse.BooleanOptionalAction, default=True,
                         help='enable chunked prefill to split long prefill requests across multiple iterations, '
                         'matching vLLM v1 behavior (default: enabled). Use --no-enable-chunked-prefill to disable')
+    parser.add_argument('--pd-handoff-mode', type=str, choices=['deferred', 'legacy'], default='deferred',
+                        help='P/D handoff policy. deferred keeps prefill KV on the P instance and admits it on '
+                        'the D instance only when decode-side memory is available (default). legacy immediately '
+                        'imports/allocates prefilled KV in add_decode, matching the old simulator behavior.')
     parser.add_argument('--enable-prefix-sharing', action='store_true', default=False,
                         help='enable second-tier prefix cache pooling across instances within a node')
     parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL'], default='None',
@@ -265,7 +269,7 @@ def main():
                         help='path to .jsonl dataset file with request traces. '
                         'If None, requests must be added manually in serving/__main__.py')
     parser.add_argument('--output', type=str, default=None,
-                        help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL). '
+                        help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL) and P/D handoff fields. '
                         'If None, results are printed to stdout only. Supports {run_id} placeholder')
     parser.add_argument('--run-id', type=str, default=None,
                         help='unique id for this simulation run. Intermediate ASTRA-Sim inputs are written under '
@@ -317,6 +321,7 @@ def main():
     num_req=args.num_reqs
     log_interval=args.log_interval
     network_backend = args.network_backend
+    pd_handoff_mode = args.pd_handoff_mode
     raw_cluster_config = _load_cluster_config_for_overrides(args.cluster_config)
     raw_instances = list(_iter_raw_instances(raw_cluster_config))
     build_enable_local_offloading = args.enable_local_offloading or any(
@@ -461,6 +466,7 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            pd_handoff_mode=pd_handoff_mode,
         ))
 
     # Controller for astra-sim process communication
@@ -587,14 +593,20 @@ def main():
         # count only finished requests
         req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
 
+        handoff_prompt_t, ready_handoffs = schedulers[instance_id].drain_ready_pd_handoffs(current)
+        prompt_th += handoff_prompt_t
+        total_prompt += handoff_prompt_t
+
         # Notify router of completed requests for dependency chain release
         if instances[instance_id]["pd_type"] != "prefill":
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
 
         # Add prefill ended requests to decode instance
-        if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
+        if instances[instance_id]["pd_type"] == "prefill" and (len(finished_reqs) > 0 or len(ready_handoffs) > 0):
+            router.transfer_prefill_request(
+                finished_reqs + ready_handoffs, source_scheduler=schedulers[instance_id],
+                current_time_ns=current)
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)

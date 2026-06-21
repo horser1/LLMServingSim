@@ -321,7 +321,8 @@ class Router:
                 scheduler.pd_type
             )
 
-    def transfer_prefill_request(self, requests):
+    def transfer_prefill_request(self, requests, source_scheduler=None, current_time_ns=-1):
         for req in requests:
             instance_id = self._select_instance(self.decode_schedulers, "decode")
-            self.decode_schedulers[instance_id].add_decode(req)
+            self.decode_schedulers[instance_id].add_decode(
+                req, source_scheduler=source_scheduler, current=current_time_ns)
