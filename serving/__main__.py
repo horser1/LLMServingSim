@@ -27,6 +27,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.telemetry import SimulationTelemetry
 import sys as flush
 
 from pyinstrument import Profiler
@@ -291,16 +292,48 @@ def main():
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--simulation-fidelity', choices=['exact', 'fast'], default='exact',
+                        help='execution-fidelity contract: exact preserves every token-level ASTRA-Sim graph '
+                        '(default); fast is explicit and may use guarded approximations when available')
+    parser.add_argument('--chakra-converter-mode', choices=['inprocess', 'subprocess'], default='inprocess',
+                        help='Chakra conversion implementation. inprocess avoids a Python fork per graph; '
+                        'subprocess is retained for parity debugging')
+    parser.add_argument('--enable-graph-cache', action=argparse.BooleanOptionalAction, default=True,
+                        help='reuse content-addressed, exact Chakra ET bundles across runs (default: enabled)')
+    parser.add_argument('--graph-cache-dir', type=str, default=None,
+                        help='directory for immutable exact graph artifacts; defaults under astra-sim/.llmservingsim-cache')
+    parser.add_argument('--graph-cache-max-gb', type=float, default=20.0,
+                        help='maximum persistent exact graph-cache size in GiB (0 = unlimited)')
+    parser.add_argument('--performance-report', type=str, default=None,
+                        help='optional JSON path for phase timings, IPC waits, graph-cache statistics, and graph sizes')
 
     args = parser.parse_args()
+    if args.graph_cache_max_gb < 0:
+        parser.error('--graph-cache-max-gb must be non-negative')
     
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    args.performance_report = _resolve_output_file(args.performance_report, args.run_id)
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
+    telemetry = SimulationTelemetry()
+    telemetry.count("simulation_fidelity_exact")
+    if args.simulation_fidelity == 'fast':
+        logger.warning(
+            "Fast fidelity was requested, but no approximate cost model is enabled in this build; "
+            "using the exact token-level path.")
+        telemetry.count("fast_requested_exact_fallback")
+    graph_cache_dir = args.graph_cache_dir or os.path.join(
+        astra_sim, '.llmservingsim-cache', 'graphs')
+    configure_graph_artifacts(
+        os.path.join(astra_sim, 'extern', 'graph_frontend', 'chakra'),
+        cache_dir=graph_cache_dir, enable_cache=args.enable_graph_cache,
+        converter_mode=args.chakra_converter_mode, telemetry=telemetry,
+        max_cache_bytes=int(args.graph_cache_max_gb * 1024 ** 3))
+    set_trace_telemetry(telemetry)
     print_banner()
     print_input_config(args=args)
     print_markup("[sim.heading]▶ Starting simulation...[/]\n")
@@ -464,7 +497,7 @@ def main():
         ))
 
     # Controller for astra-sim process communication
-    controller = Controller(total_npu)
+    controller = Controller(total_npu, telemetry=telemetry)
     # Global Request Router
     router = Router(num_instances, schedulers, num_req, request_routing_policy)
     # Power Modeling if enabled
@@ -578,7 +611,8 @@ def main():
             waiting_request[instance_id] = True
 
         # check request is done
-        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
+        with telemetry.phase('scheduler_completion'):
+            prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -597,7 +631,8 @@ def main():
             router.transfer_prefill_request(finished_reqs)
 
         # schedule requests
-        new_req = schedulers[instance_id].schedule(current, sys, id)
+        with telemetry.phase('scheduler_schedule'):
+            new_req = schedulers[instance_id].schedule(current, sys, id)
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
         # Check if a pre-generated workload is ready for this instance (from DP sync)
@@ -644,7 +679,7 @@ def main():
                         batch, nid = dp_pending[dg][inst_id]
                         inst = instances[inst_id]
                         inst_cfg = instance_runtime_configs[inst_id]
-                        generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                        descriptor = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                        inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                        nid, inst_id,
                                        inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
@@ -657,13 +692,13 @@ def main():
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                                       inputs_root=run_paths.inputs_root, materialize=False)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
                                        workload_name=dp_workload_name,
                                        inputs_root=run_paths.inputs_root,
-                                       cleanup_trace=args.cleanup_inputs)
+                                       cleanup_trace=args.cleanup_inputs, descriptor=descriptor)
                         if inst_id != instance_id:
                             dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                     workload_name=dp_workload_name,
@@ -711,7 +746,7 @@ def main():
                             batch, nid = dp_pending[dg][inst_id]
                             inst = instances[inst_id]
                             inst_cfg = instance_runtime_configs[inst_id]
-                            generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                            descriptor = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                            inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                            nid, inst_id,
                                            inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
@@ -724,13 +759,13 @@ def main():
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                                           inputs_root=run_paths.inputs_root, materialize=False)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
                                            workload_name=dp_workload_name,
                                            inputs_root=run_paths.inputs_root,
-                                           cleanup_trace=args.cleanup_inputs)
+                                           cleanup_trace=args.cleanup_inputs, descriptor=descriptor)
                             if inst_id != instance_id:
                                 dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                         workload_name=dp_workload_name,
@@ -748,7 +783,7 @@ def main():
                 else:
                     # Independent instance: generate trace immediately
                     inst_cfg = instance_runtime_configs[instance_id]
-                    generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
+                    descriptor = generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
                                    instance["local_ep"], instance["ep_total"],
                                    instance["pd_type"],
                                    node_id, instance_id,
@@ -760,12 +795,12 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                   inputs_root=run_paths.inputs_root, materialize=False)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
                                    inputs_root=run_paths.inputs_root,
-                                   cleanup_trace=args.cleanup_inputs)
+                                   cleanup_trace=args.cleanup_inputs, descriptor=descriptor)
                     workload = get_workload(new_req, instance["hardware"], instance_id,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
@@ -1030,6 +1065,10 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+
+    if args.performance_report is not None:
+        telemetry.write_json(args.performance_report)
+        logger.info("Wrote simulation performance report: %s", args.performance_report)
 
     if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)

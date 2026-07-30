@@ -15,6 +15,29 @@ Complete reference for every command-line flag accepted by
 | --- | --- | --- | --- |
 | `--cluster-config` | path | `configs/cluster/single_node_single_instance.json` | Path to a cluster-config JSON. See **[Cluster config](./cluster-config)** |
 | `--network-backend` | choice | `analytical` | Network simulation backend. `analytical` (fast) or `ns3` (detailed, WIP) |
+| `--simulation-fidelity` | `exact` / `fast` | `exact` | Simulation-cost contract, independent of `--network-backend`. `exact` executes every token-level ASTRA-Sim graph. `fast` is an explicit opt-in for guarded approximation features; if none applies, it reports a fallback and executes the exact path. |
+
+## Exact graph artifacts and performance reports
+
+The default exact path constructs one canonical `IterationDescriptor` per
+scheduled batch. It contains the state-sensitive batch/KV values, the exact
+Chakra text representation, and an independently replayable power-accounting
+delta. Chakra conversion and graph reuse operate on that descriptor, not on a
+second scheduler implementation, so they do not skip token-level events.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--chakra-converter-mode` | `inprocess` / `subprocess` | `inprocess` | Convert Chakra LLM traces in the serving process. Use `subprocess` to compare against the legacy converter invocation during debugging. |
+| `--enable-graph-cache` / `--no-enable-graph-cache` | bool | `true` | Reuse immutable, content-addressed Chakra `.et` bundles. A key includes canonical trace bytes, NPU count and offset, local-offloading mode, and the converter source hash. A cache hit still submits the same graph to ASTRA-Sim. |
+| `--graph-cache-dir` | path | `astra-sim/.llmservingsim-cache/graphs` | Persistent cache location. It is intentionally outside the per-run input root, so `--cleanup-inputs` never removes reusable entries. |
+| `--graph-cache-max-gb` | float | `20` | LRU capacity for the persistent graph cache. `0` disables the size limit. |
+| `--performance-report` | path | `None` | Write JSON phase timings and counters, including scheduler work, trace synthesis/materialization, Chakra conversion, IPC waits, cache hits/misses, graph node counts, and ET bytes. `{run_id}` is expanded like `--output`. |
+
+The graph cache is an exact optimization: changing a dynamic attention/KV
+value changes canonical trace bytes and therefore cannot reuse a stale graph.
+It is also safe for DP groups because each rank's graph has its own complete
+converter identity; a shared workload folder only receives its corresponding
+rank artifacts.
 
 ## Batching and scheduling
 

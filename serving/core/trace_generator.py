@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import hashlib
 from .request import *
 from .utils import *
 import pandas as pd
@@ -20,8 +22,15 @@ from dataclasses import dataclass, field
 # value: dict with keys {meta, architecture, catalog, sequence, tables}
 # ----------------------------------------------------------------------
 _perf_db_cache = {}
+_telemetry = None
 
 logger = get_logger("TraceGenerator")
+
+
+def set_trace_telemetry(telemetry):
+    """Set optional run-scoped observer for trace synthesis phases."""
+    global _telemetry
+    _telemetry = telemetry
 
 
 # ----------------------------------------------------------------------
@@ -147,6 +156,74 @@ class PowerAccumulator:
         if enable_attn_offloading:
             for lat in self.pim_latencies_ns:
                 ctx.power_model.add_pim_active_energy_consumption(ctx.node_id, lat)
+
+
+@dataclass(frozen=True)
+class PowerAccountingDelta:
+    """Power-model calls produced while building one iteration.
+
+    Trace construction must be side-effect free so a descriptor can be cached
+    or converted more than once.  Replaying this small operation log at the
+    point where the graph is submitted preserves the legacy accounting order.
+    """
+
+    operations: tuple = ()
+
+    def replay(self, power_model, node_id):
+        if power_model is None:
+            return
+        power_model.reset_log()
+        for method, args, kwargs in self.operations:
+            getattr(power_model, method)(*args, **kwargs)
+        power_model.print_log(node_id)
+
+
+class _PowerRecorder:
+    """Drop-in recorder for the PowerModel calls used by trace synthesis."""
+
+    def __init__(self):
+        self.operations = []
+
+    def _record(self, method, *args, **kwargs):
+        self.operations.append((method, args, kwargs))
+
+    def add_dram_energy_consumption(self, *args, **kwargs):
+        self._record("add_dram_energy_consumption", *args, **kwargs)
+
+    def add_link_energy_consumption(self, *args, **kwargs):
+        self._record("add_link_energy_consumption", *args, **kwargs)
+
+    def add_npu_active_energy_consumption(self, *args, **kwargs):
+        self._record("add_npu_active_energy_consumption", *args, **kwargs)
+
+    def add_pim_active_energy_consumption(self, *args, **kwargs):
+        self._record("add_pim_active_energy_consumption", *args, **kwargs)
+
+
+@dataclass(frozen=True)
+class IterationDescriptor:
+    """Pure, canonical description of an iteration submitted to ASTRA-Sim.
+
+    ``trace_bytes`` is intentionally retained for the first implementation:
+    it is both the exact legacy converter input and a stable content-addressed
+    cache key.  The remaining fields expose the state-sensitive dynamic values
+    needed by future graph templates and fast-mode planners without letting
+    either path invent an alternative scheduler transition.
+    """
+
+    trace_bytes: bytes
+    trace_sha256: str
+    static: dict
+    batch: dict
+    kv: dict
+    memory: dict
+    power_delta: PowerAccountingDelta
+
+    @property
+    def node_count(self):
+        # First two lines are execution type and count; the third is the table
+        # header.  This includes EXPERT/PIM markers exactly as Chakra sees it.
+        return max(0, len(self.trace_bytes.decode("utf-8").splitlines()) - 3)
 
 
 # ======================================================================
@@ -1296,7 +1373,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, trace_stream=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1312,7 +1389,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
-    with open(output_path, 'w') as f:
+    def emit(f):
         _emit_prologue(ctx, bctx, f)
 
         # Transformer blocks
@@ -1339,6 +1416,12 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         _emit_final_layers(ctx, bctx, f)
         _emit_pp_pd_power(ctx, bctx)
 
+    if trace_stream is not None:
+        emit(trace_stream)
+    else:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            emit(f)
+
 
 # ======================================================================
 # _synthesize_interleaved_trace (two sub-batches)
@@ -1349,7 +1432,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0, trace_stream=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1374,7 +1457,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
     num_layers = config['num_hidden_layers']
 
-    with open(output_path, 'w') as f:
+    def emit(f):
         # PROLOGUE: Batch1 prologue + first pre-attn
         _emit_prologue(ctx, bctx1, f, 'BATCH_1')
 
@@ -1439,18 +1522,31 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
         _emit_pp_pd_power(ctx, bctx1)
 
+    if trace_stream is not None:
+        emit(trace_stream)
+    else:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            emit(f)
+
 
 # ======================================================================
 # generate_trace() — public entry point
 # ======================================================================
 
-# Wrapper function that creates trace for an instance
-def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
-                   max_num_batched_tokens=2048, max_num_seqs=None,
-                   placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
-                   enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
-                   enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+def build_iteration_descriptor(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None,
+                               node_id=0, instance_id=0, max_num_batched_tokens=2048,
+                               max_num_seqs=None, placement={}, block_mode_on=False,
+                               expert_routing_policy="BALANCED", enable_prefix_caching=False,
+                               enable_attn_offloading=False, power_model=None, pim_model=None,
+                               enable_sub_batch_interleaving=False, fp=16, dtype=None,
+                               kv_cache_dtype='auto', tp_dim=None, ep_dim=None,
+                               dp_sum_total_len=0, enable_block_copy=True):
+    """Build the exact legacy Chakra input without touching the filesystem.
+
+    This is deliberately the only place which derives a trace from a scheduled
+    batch.  Consumers may materialize it as text, convert it in process, or
+    use its digest as a graph-cache key, while scheduling remains unchanged.
+    """
 
     model = batch.model
     config = get_config(model)
@@ -1461,14 +1557,6 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     # vllm: add load or eviction in the txt file
     load_size = batch.load
     evict_size = batch.evict
-
-    if inputs_root is None:
-        inputs_root = os.path.join(os.getcwd(), "inputs")
-    output_path = input_path(
-        inputs_root, "trace", hardware, batch.model,
-        f"instance{instance_id}_batch{batch.batch_id}.txt",
-    )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # make trace — accept either the Mistral-style ``num_local_experts``
     # key or the HF/Qwen3 ``num_experts`` key so both family's configs
@@ -1485,9 +1573,9 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     else:
         gate = None
 
-    # reset power model logs
-    if power_model is not None:
-        power_model.reset_log()
+    # Record power operations while synthesising.  The descriptor can then be
+    # cached or converted repeatedly without double-counting energy.
+    power_recorder = _PowerRecorder() if power_model is not None else None
 
     # make trace
     synth_args = (hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id)
@@ -1497,67 +1585,144 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     del enable_prefix_caching
     synth_kwargs = dict(placement=placement, block_mode_on=block_mode_on, gate=gate,
                         enable_attn_offloading=enable_attn_offloading,
-                        power_model=power_model, pim_model=pim_model, fp=fp,
+                        power_model=power_recorder, pim_model=pim_model, fp=fp,
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+    trace_stream = io.StringIO()
     if not enable_sub_batch_interleaving:
-        _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
+        _synthesize_trace(*synth_args, batch, max_len, None, trace_stream=trace_stream, **synth_kwargs)
     else:
         batches = _make_sub_batch(batch)
         if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
-            _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
+            _synthesize_trace(*synth_args, batch, max_len, None, trace_stream=trace_stream, **synth_kwargs)
         else:
-            _synthesize_interleaved_trace(*synth_args, batches, max_len, output_path, **synth_kwargs)
+            _synthesize_interleaved_trace(*synth_args, batches, max_len, None,
+                                          trace_stream=trace_stream, **synth_kwargs)
 
-    with open(output_path, 'r') as f:
-        dic = []
-        for line in f.readlines():
-            split = re.findall(r'\S+', line)
-            dic.append(split)
+    dic = [re.findall(r'\S+', line) for line in trace_stream.getvalue().splitlines()]
 
     # vllm: open output txt file and add load, evict mem
     mem = []
     if load_size != 0:
         load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(load)
-        if power_model is not None:
-            power_model.add_dram_energy_consumption(node_id, load_size)
+        if power_recorder is not None:
+            power_recorder.add_dram_energy_consumption(node_id, load_size)
     if evict_size != 0:
         evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(evict)
-        if power_model is not None:
-            power_model.add_dram_energy_consumption(node_id, evict_size)
-
-    if power_model is not None:
-        power_model.print_log(node_id)
+        if power_recorder is not None:
+            power_recorder.add_dram_energy_consumption(node_id, evict_size)
 
     result = mem + dic
 
-    with open(output_path, 'w') as f:
-        # instance type
-        if pd_type == None:
-            instance_type = 'COLOCATED'
-        elif pd_type == 'prefill':
-            instance_type = 'PREFILL'
-        elif pd_type == 'decode':
-            instance_type = 'DECODE'
+    # instance type
+    if pd_type is None:
+        instance_type = 'COLOCATED'
+    elif pd_type == 'prefill':
+        instance_type = 'PREFILL'
+    elif pd_type == 'decode':
+        instance_type = 'DECODE'
+    else:
+        raise ValueError(f"Unknown instance type {pd_type}.")
+
+    final_stream = io.StringIO()
+    final_stream.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
+    final_stream.write(str(len(result)) + '\n')
+    final_stream.write(header())
+    for i, row in enumerate(result):
+        if "EXPERT" not in row[0] and "PIM" not in row[0]:
+            final_stream.write(formatter(f'{row[0]}_{i}', *row[1:]))
         else:
-            raise ValueError(f"Unknown instance type {pd_type}.")
+            final_stream.write(formatter(' '.join(row), '', '', '', '', '', '', '', '', '', ''))
 
-        f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
-        f.write(str(len(result))+'\n')
-        f.write(header())
+    trace_bytes = final_stream.getvalue().encode('utf-8')
+    bctx = _build_batch_ctx(batch, _build_trace_ctx(
+        hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
+        placement, gate, enable_attn_offloading, None, pim_model, pd_type,
+        variant=variant, kv_cache_dtype=kv_cache_dtype,
+        runtime_max_num_batched_tokens=max_num_batched_tokens,
+        runtime_max_num_seqs=max_num_seqs, tp_dim=tp_dim, ep_dim=ep_dim,
+        dp_sum_total_len=dp_sum_total_len))
+    return IterationDescriptor(
+        trace_bytes=trace_bytes,
+        trace_sha256=hashlib.sha256(trace_bytes).hexdigest(),
+        static={
+            "model": model, "hardware": hardware, "variant": variant,
+            "tp_size": tp_size, "pp_size": pp_size, "local_ep": local_ep,
+            "ep_total": ep_total, "node_id": node_id, "instance_id": instance_id,
+            "pd_type": pd_type, "placement": placement,
+            "attention_offloading": enable_attn_offloading,
+            "collective_dimensions": {"tp": tp_dim, "ep": ep_dim},
+        },
+        batch={
+            "batch_id": batch.batch_id, "total_len": bctx.total_len,
+            "lm_head_len": bctx.lm_head_len, "prefill_chunk": bctx.prefill_chunk,
+            "kv_prefill": bctx.kv_prefill, "n_decode": bctx.n_decode,
+        },
+        kv={
+            "decode_mean": bctx.kv_decode_mean, "decode_max": bctx.kv_decode_max,
+            "decode_min": bctx.kv_decode_min,
+            "decode_distribution": tuple(batch.decode_k_list),
+            "pim_channel_distribution": tuple(tuple(x) for x in (bctx.decode_lens or [])),
+        },
+        memory={"kv_load_bytes": load_size, "kv_evict_bytes": evict_size},
+        power_delta=PowerAccountingDelta(
+            tuple(power_recorder.operations) if power_recorder is not None else ()),
+    )
 
-        # add layer_number at the end of the layer_name
-        for i in range(0, len(result)):
-            if "EXPERT" not in result[i][0] and "PIM" not in result[i][0]:
-                new_string = f'{result[i][0]}_{i}'
-                f.write(formatter(new_string, *result[i][1:]))
-            else:
-                f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
-    return
+
+def materialize_trace(descriptor, output_path, power_model=None, node_id=0):
+    """Write an already-built descriptor and replay its power delta once."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'wb') as f:
+        f.write(descriptor.trace_bytes)
+    descriptor.power_delta.replay(power_model, node_id)
+
+
+# Compatibility wrapper used by the existing scheduling loop.  It now returns
+# the descriptor as well, allowing new callers to bypass text-file synthesis.
+def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
+                   max_num_batched_tokens=2048, max_num_seqs=None,
+                   placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
+                   enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
+                   enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   materialize=True):
+    if _telemetry is not None:
+        with _telemetry.phase("trace_synthesis"):
+            descriptor = build_iteration_descriptor(
+                batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
+                max_num_batched_tokens, max_num_seqs, placement, block_mode_on,
+                expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model,
+                pim_model, enable_sub_batch_interleaving, fp, dtype, kv_cache_dtype, tp_dim, ep_dim,
+                dp_sum_total_len, enable_block_copy)
+    else:
+        descriptor = build_iteration_descriptor(
+            batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
+            max_num_batched_tokens, max_num_seqs, placement, block_mode_on,
+            expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model,
+            pim_model, enable_sub_batch_interleaving, fp, dtype, kv_cache_dtype, tp_dim, ep_dim,
+            dp_sum_total_len, enable_block_copy)
+    if materialize:
+        if inputs_root is None:
+            inputs_root = os.path.join(os.getcwd(), "inputs")
+        output_path = input_path(
+            inputs_root, "trace", hardware, batch.model,
+            f"instance{instance_id}_batch{batch.batch_id}.txt",
+        )
+        if _telemetry is not None:
+            with _telemetry.phase("trace_materialization"):
+                materialize_trace(descriptor, output_path, power_model, node_id)
+        else:
+            materialize_trace(descriptor, output_path, power_model, node_id)
+    else:
+        # Power accounting remains part of the submitted iteration even when
+        # its text representation stays in memory for the artifact provider.
+        descriptor.power_delta.replay(power_model, node_id)
+    return descriptor
 
 
 # ======================================================================

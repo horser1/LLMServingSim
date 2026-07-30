@@ -2,15 +2,20 @@ import re
 from .logger import get_logger
 
 class Controller():
-    def __init__(self, total_num):
+    def __init__(self, total_num, telemetry=None):
         self.end_dict = {}
         self.total_num = total_num
+        self.telemetry = telemetry
         self.logger = get_logger(self.__class__)
         for i in range(total_num):
             self.end_dict[i] = -1
 
 
     def read_wait(self, p):
+        start = None
+        if self.telemetry is not None:
+            from time import perf_counter_ns
+            start = perf_counter_ns()
         out = [""]
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
             line = p.stdout.readline()
@@ -18,6 +23,9 @@ class Controller():
             # print(line, end='')
             out.append(line)
             p.stdout.flush()
+        if start is not None:
+            self.telemetry.phase_ns["astra_ipc_wait"] += perf_counter_ns() - start
+            self.telemetry.phase_calls["astra_ipc_wait"] += 1
         return out
 
     def check_end(self, p):
@@ -30,10 +38,17 @@ class Controller():
         return out
 
     def write_flush(self, p, input):
+        start = None
+        if self.telemetry is not None:
+            from time import perf_counter_ns
+            start = perf_counter_ns()
         # For debugging
         # print(input)
         p.stdin.write(input+'\n')
         p.stdin.flush()
+        if start is not None:
+            self.telemetry.phase_ns["astra_ipc_write"] += perf_counter_ns() - start
+            self.telemetry.phase_calls["astra_ipc_write"] += 1
         return
 
     def parse_output(self, output):
