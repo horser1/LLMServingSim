@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -60,6 +63,31 @@ class GraphArtifactProvider:
     @staticmethod
     def _manifest_path(entry):
         return os.path.join(entry, "manifest.json")
+
+    @contextlib.contextmanager
+    def _entry_lock(self, key, blocking=True):
+        lock_dir = os.path.join(self.cache_dir, ".locks")
+        os.makedirs(lock_dir, exist_ok=True)
+        lock_path = os.path.join(lock_dir, f"{key}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        acquired = False
+        try:
+            flags = fcntl.LOCK_EX
+            if not blocking:
+                flags |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(fd, flags)
+                acquired = True
+            except OSError as error:
+                if not blocking and error.errno in (errno.EACCES, errno.EAGAIN):
+                    yield False
+                    return
+                raise
+            yield True
+        finally:
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _valid_entry(self, entry, key):
         try:
@@ -129,9 +157,12 @@ class GraphArtifactProvider:
                 if name.startswith("llm.") and name.endswith(".et"):
                     with open(os.path.join(tmp, name), "rb") as f:
                         files[name] = hashlib.sha256(f.read()).hexdigest()
-            if len(files) != int(num_npus):
+            execution_type = trace_bytes.split(None, 1)[0].decode("ascii")
+            expected_files = int(num_npus) * (2 if execution_type == "PREFILL" else 1)
+            if len(files) != expected_files:
                 raise RuntimeError(
-                    f"Chakra conversion produced {len(files)} ET files, expected {num_npus}.")
+                    f"Chakra conversion produced {len(files)} ET files, "
+                    f"expected {expected_files} for {execution_type}.")
             manifest = {
                 "schema": _CACHE_SCHEMA, "key": key, "identity": identity,
                 "created_at": time(), "files": files,
@@ -141,7 +172,9 @@ class GraphArtifactProvider:
             try:
                 os.replace(tmp, entry)
                 tmp = None
-            except FileExistsError:
+            except OSError as error:
+                if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
                 # Another process populated the same immutable content key.
                 pass
         finally:
@@ -180,8 +213,13 @@ class GraphArtifactProvider:
                 break
             if os.path.abspath(entry) == os.path.abspath(protected_entry):
                 continue
-            shutil.rmtree(entry, ignore_errors=True)
-            total -= size
+            key = os.path.basename(entry)
+            with self._entry_lock(key, blocking=False) as acquired:
+                if not acquired:
+                    continue
+                if os.path.isdir(entry):
+                    shutil.rmtree(entry, ignore_errors=True)
+                    total -= size
 
     def provide(self, trace_bytes, output_prefix, num_npus, npu_offset=0,
                 local_offloading=False):
@@ -210,26 +248,27 @@ class GraphArtifactProvider:
 
         key, identity = self._key(trace_bytes, num_npus, npu_offset, local_offloading)
         entry = os.path.join(self.cache_dir, key)
-        manifest = self._valid_entry(entry, key)
-        hit = manifest is not None
-        if not hit:
-            if self.telemetry is not None:
-                with self.telemetry.phase("chakra_converter"):
-                    self._build_entry(entry, trace_bytes, num_npus, npu_offset, local_offloading, key, identity)
-            else:
-                self._build_entry(entry, trace_bytes, num_npus, npu_offset, local_offloading, key, identity)
+        with self._entry_lock(key):
             manifest = self._valid_entry(entry, key)
-            if manifest is None:
-                raise RuntimeError(f"Graph cache entry failed validation: {entry}")
-        if self.telemetry is not None:
-            with self.telemetry.phase("et_materialization"):
+            hit = manifest is not None
+            if not hit:
+                if self.telemetry is not None:
+                    with self.telemetry.phase("chakra_converter"):
+                        self._build_entry(entry, trace_bytes, num_npus, npu_offset, local_offloading, key, identity)
+                else:
+                    self._build_entry(entry, trace_bytes, num_npus, npu_offset, local_offloading, key, identity)
+                manifest = self._valid_entry(entry, key)
+                if manifest is None:
+                    raise RuntimeError(f"Graph cache entry failed validation: {entry}")
+            if self.telemetry is not None:
+                with self.telemetry.phase("et_materialization"):
+                    self._materialize(entry, output_prefix, manifest)
+            else:
                 self._materialize(entry, output_prefix, manifest)
-        else:
-            self._materialize(entry, output_prefix, manifest)
-        try:
-            os.utime(entry, None)
-        except FileNotFoundError:
-            pass
+            try:
+                os.utime(entry, None)
+            except FileNotFoundError:
+                pass
         if not hit and self.max_bytes is not None and self.max_bytes > 0:
             self._entries_since_prune += 1
             if self._entries_since_prune >= _PRUNE_INTERVAL:
